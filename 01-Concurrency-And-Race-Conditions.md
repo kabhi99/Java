@@ -109,6 +109,8 @@ synchronized void b() { ... }
 
  **What it does**: Guarantees **visibility** across threads (write by one thread is immediately visible to others). **Does NOT** guarantee atomicity.
 
+> Think of it as: "always read fresh from main memory, always write through to main memory" — no thread-local CPU caching. **NOT** "this whole operation is one atomic step."
+
 ```java
 //  CORRECT use: flag for stopping a thread
 class Worker implements Runnable {
@@ -124,7 +126,110 @@ private volatile int count = 0;
 count++;   //  Read-modify-write — volatile doesn't help
 ```
 
-**RULE**: Use `volatile` for **single read or single write** of a flag/reference. For **read-modify-write**, use atomics or locks.
+#### **GOLDEN RULE: `volatile` vs Atomic / Lock**
+
+> Use `volatile` for **single read or single write** of a flag/reference.
+> For **read-modify-write**, use atomics or locks.
+
+**"Single read" means**: just read the variable, no computation based on it:
+```java
+if (shutdown) return;   //  read once, decide
+```
+
+**"Single write" means**: just assign the variable, no logic depending on current value:
+```java
+shutdown = true;         //  write once, done
+```
+
+**"Read-modify-write" means**: 3 separate steps (read → compute → write) that can be interleaved:
+```java
+count++;                 //  1) READ count  2) ADD 1  3) WRITE count
+balance -= amount;       //  same — 3 steps
+if (x == null) x = ...;  //  same — check, decide, write
+```
+
+**Why `volatile` fails for read-modify-write (count=10, both threads call increment()):**
+```
+Time | Thread A             | Thread B             | count in memory
+-----|----------------------|----------------------|----------------
+  1  | reads count = 10     |                      | 10
+  2  |                      | reads count = 10     | 10
+  3  | computes 10 + 1 = 11 |                      | 10
+  4  |                      | computes 10 + 1 = 11 | 10
+  5  | writes 11            |                      | 11
+  6  |                      | writes 11            | 11   ← BUG! lost +1
+```
+
+Expected: `count = 12`. Actual: `count = 11`. `volatile` didn't help — both threads correctly read the latest value (10) and correctly wrote their new value (11). The 3 steps weren't atomic as a whole.
+
+**Decision table:**
+```
++----------------------------------+----------+--------------+
+| Operation                         | volatile | atomic/lock  |
++----------------------------------+----------+--------------+
+| boolean shutdown = true;          |  ENOUGH  | not needed   |
+| if (shutdown) return;             |  ENOUGH  | not needed   |
+| config = new Config(...);         |  ENOUGH  | not needed   |
+| (replace immutable object ref)    |          |              |
++----------------------------------+----------+--------------+
+| count++;                          |  FAILS   |  needed     |
+| count = count + 1;                |  FAILS   |  needed     |
+| if (x == null) x = new X();       |  FAILS   |  needed     |
+| balance -= amount;                |  FAILS   |  needed     |
++----------------------------------+----------+--------------+
+```
+
+#### **The 4 classic patterns where `volatile` IS the right tool**
+
+```java
+// 1. SHUTDOWN FLAG — single read in loop, single write to stop
+class Worker {
+    private volatile boolean running = true;
+    public void run() { while (running) doWork(); }   // single read
+    public void stop() { running = false; }            // single write
+}
+
+// 2. PUBLISHING AN IMMUTABLE OBJECT — replace whole reference atomically
+class ConfigHolder {
+    private volatile Config config;                    // Config is immutable
+    public Config get() { return config; }             // single read
+    public void update(Config c) { this.config = c; }  // single write
+}
+
+// 3. DOUBLE-CHECKED LOCKING (DCL) — volatile prevents partial-construction visibility
+class Singleton {
+    private static volatile Singleton INSTANCE;        //  volatile REQUIRED
+    public static Singleton get() {
+        if (INSTANCE == null) {
+            synchronized (Singleton.class) {
+                if (INSTANCE == null) INSTANCE = new Singleton();
+            }
+        }
+        return INSTANCE;
+    }
+}
+
+// 4. HAPPENS-BEFORE PUBLICATION — volatile write also publishes prior writes
+class Result {
+    int value;                                          // not volatile!
+    volatile boolean ready;                             // single volatile flag
+
+    void produce() {
+        value = heavyCompute();                         // ordinary write
+        ready = true;                                   // volatile write → publishes 'value' too
+    }
+    int consume() {
+        while (!ready) {}                               // single volatile read
+        return value;                                   //  safe — sees producer's value
+    }
+}
+```
+
+#### **One-line summary**
+
+> **`volatile` = visibility only. The moment your operation depends on the current value, you need atomics or locks.**
+
+This is the #1 interview trick: `volatile int count = 0; count++;` looks correct, compiles fine, even works in single-threaded tests — silently breaks under contention.
 
 ### **2.3 Atomic Classes (`java.util.concurrent.atomic`)**
 
@@ -174,6 +279,174 @@ lock.lockInterruptibly();   // responds to thread.interrupt()
 | **Interruptible** wait | `lockInterruptibly()` |
 | **Fair** ordering (FIFO) | `new ReentrantLock(true)` |
 | Multiple **condition** variables | `lock.newCondition()` |
+
+#### **DEEP DIVE: The 3 ReentrantLock Superpowers**
+
+##### **A. Interruptible wait — `lockInterruptibly()`**
+
+**The problem with `synchronized` / `lock.lock()`**: Once a thread is **waiting** for a lock, it CANNOT be cancelled. Even calling `thread.interrupt()` does nothing — if the lock holder is stuck forever, the waiter is stuck forever too.
+
+```java
+//  synchronized — UNINTERRUPTIBLE wait
+public void process() {
+    synchronized (lock) { doWork(); }    //  if blocked here, interrupt does NOTHING
+}
+
+//  ReentrantLock — interruptible
+public void process() throws InterruptedException {
+    lock.lockInterruptibly();             //  can bail out while waiting
+    try { doWork(); }
+    finally { lock.unlock(); }
+}
+```
+
+**Real-world: graceful shutdown**
+```java
+@Service
+public class OrderProcessor {
+    private final ReentrantLock lock = new ReentrantLock();
+
+    public void process(Order o) throws InterruptedException {
+        lock.lockInterruptibly();        // SIGTERM can cancel mid-wait
+        try { saveToDb(o); }
+        finally { lock.unlock(); }
+    }
+
+    @PreDestroy
+    void shutdown() { workers.forEach(Thread::interrupt); }   // waiters bail out
+}
+```
+
+Without `lockInterruptibly()`, `kubectl delete pod` would wait the full `terminationGracePeriodSeconds` because waiters can't be cancelled.
+
+> **RULE**: Use `lockInterruptibly()` for anything that should respect cancellation — shutdown, request timeout, user-cancelled job.
+
+##### **B. Fair ordering (FIFO) — `new ReentrantLock(true)`**
+
+**Default locks are UNFAIR**: the JVM grants the lock to any waiting thread, often the **newest** one (it's already running on the CPU — cheap to wake). This causes **starvation** — an early waiter sits there for minutes while late arrivals jump the queue.
+
+```java
+ReentrantLock unfair = new ReentrantLock();        // default = unfair (fast)
+ReentrantLock fair   = new ReentrantLock(true);    // FIFO (slower, no starvation)
+```
+
+**How unfairness causes starvation:**
+```
+Time | Queue            | Released | JVM grants to
+-----|------------------|----------|-----------------
+  1  | [T1, T2, T3]     | yes      | T3  ← newest jumps queue
+  2  | [T1, T2, T4]     | yes      | T4
+  3  | [T1, T2, T5]     | yes      | T5  ← T1 STILL waiting!
+```
+
+**With fair lock:**
+```
+Time | Queue            | Released | Granted to
+-----|------------------|----------|-----------------
+  1  | [T1, T2, T3]     | yes      | T1  ← FIFO
+  2  | [T2, T3, T4]     | yes      | T2
+```
+
+**Trade-off**: Fair locks are **~10× slower** under contention (must coordinate ordered queue, no opportunistic grabs). Only use fair when you've **observed actual starvation** in metrics.
+
+> **RULE**: Default unfair = faster. Use `new ReentrantLock(true)` only when starvation is a real problem.
+
+##### **C. Multiple condition variables — `lock.newCondition()`**
+
+**The problem with `Object.wait()/notify()`**: Only **ONE wait queue per object**. So `notifyAll()` wakes everyone, even threads waiting for a different condition — they recheck, find their condition still false, go back to sleep. **Wasted CPU + lost-wakeup bugs.**
+
+`Condition` lets you have **multiple independent wait queues** under the same lock.
+
+**Classic example: Bounded Buffer (Producer-Consumer)** — producers block when **full**, consumers block when **empty**. Different conditions.
+
+**BAD — one shared wait queue (`synchronized`):**
+```java
+public synchronized void put(T item) throws InterruptedException {
+    while (q.size() == capacity) wait();   // one shared queue
+    q.add(item);
+    notifyAll();   //  wakes producers AND consumers — producers go right back to sleep
+}
+
+public synchronized T take() throws InterruptedException {
+    while (q.isEmpty()) wait();
+    T item = q.poll();
+    notifyAll();   //  wakes everyone again
+    return item;
+}
+```
+
+50 producers + 50 consumers → every `notifyAll()` wakes all 100; most go right back to sleep.
+
+**GOOD — two separate Conditions:**
+```java
+private final ReentrantLock lock     = new ReentrantLock();
+private final Condition     notFull  = lock.newCondition();   //  producer queue
+private final Condition     notEmpty = lock.newCondition();   //  consumer queue
+
+public void put(T item) throws InterruptedException {
+    lock.lock();
+    try {
+        while (q.size() == capacity) notFull.await();   // producers wait here
+        q.add(item);
+        notEmpty.signal();                              //  wake ONE consumer only
+    } finally { lock.unlock(); }
+}
+
+public T take() throws InterruptedException {
+    lock.lock();
+    try {
+        while (q.isEmpty()) notEmpty.await();           // consumers wait here
+        T item = q.poll();
+        notFull.signal();                                //  wake ONE producer only
+        return item;
+    } finally { lock.unlock(); }
+}
+```
+
+**What changed:**
+```
++----------------------------+--------------------+----------------------+
+| Aspect                      | synchronized       | Condition            |
++----------------------------+--------------------+----------------------+
+| Wait queues                 | 1 (shared)         | 2 (separate)         |
+| notifyAll() wakes           | Everyone           | Only matching group  |
+| signal() wakes              | n/a                | Exactly ONE thread   |
+| CPU waste                   | High (false wakes) | None                 |
++----------------------------+--------------------+----------------------+
+```
+
+**Mental model:**
+```
+synchronized:                       Condition (2 of them):
++-----------+                       +----------+  +-----------+
+| Everyone  |                       | Producers|  | Consumers |
+|  waiting  |                       |  waiting |  |  waiting  |
++-----------+                       +----------+  +-----------+
+     ↑                                   ↑              ↑
+ notifyAll() wakes ALL          notFull.signal()  notEmpty.signal()
+                                (wakes 1 producer) (wakes 1 consumer)
+```
+
+> **RULE**: Use multiple `Condition`s whenever threads are waiting for **different** events under the same lock. Otherwise you wake everyone needlessly.
+
+##### **Quick decision: `synchronized` vs `ReentrantLock`**
+
+```
++-----------------------------------------+-----------------+-----------------+
+| Feature                                  | synchronized    | ReentrantLock   |
++-----------------------------------------+-----------------+-----------------+
+| Auto-release on exit                     |  yes            | manual unlock() |
+| Interruptible wait                       |  no             |  yes            |
+| Try-acquire with timeout                 |  no             |  yes            |
+| Fair ordering                            |  no             |  optional       |
+| Multiple wait queues (Condition)         |  no             |  yes            |
+| Lock across method boundaries            | hard            | easy            |
+| Performance (uncontended)                | great           | great           |
+| Simplicity                               | best            | more code       |
++-----------------------------------------+-----------------+-----------------+
+```
+
+**Default**: `synchronized` for simple cases. Switch to `ReentrantLock` when you need ANY of the 3 superpowers above.
 
 ### **2.5 `ReadWriteLock` (many readers, few writers)**
 
