@@ -9,7 +9,9 @@
 5. Thread Pools & Executors
 6. Patterns: Producer-Consumer, Read-Write, Double-Checked Locking
 7. Common Interview Bugs & Fixes
-8. Golden Rules & Interview Cheat Codes
+8. Golden Rules
+9. Interview Cheat Codes + Immutability
+10. **Concurrency in Distributed Systems** (JVM locks vs DB locks vs distributed locks)
 
 ---
 
@@ -783,3 +785,276 @@ public final class Money {
 5. Operations return **new** instances
 
 > If you can make it immutable, you don't need any other concurrency primitive.
+
+---
+
+## PART 10: CONCURRENCY IN DISTRIBUTED SYSTEMS
+
+> "Do we still use `synchronized` / `ReentrantLock` in modern microservices?" — common interview question.
+>
+> **Short answer**: Yes, but for different problems than people think. `synchronized` solves in-JVM thread safety. In distributed systems, contention usually lives in the **DB or Redis**, not in app memory. So JVM locks are RARELY the right tool across pods.
+
+### **10.1 The 3 Different "Concurrency Problems"**
+
+```
++-----------------------------------------+------------------------------+
+| Problem                                  | Tool                         |
++-----------------------------------------+------------------------------+
+| 1. Multiple THREADS in 1 JVM             | synchronized /                |
+|    (singleton bean with state, batch)    | ReentrantLock / Atomic       |
++-----------------------------------------+------------------------------+
+| 2. Multiple PODS sharing DB rows         | DB (optimistic/pessimistic   |
+|    (most common in microservices)        | lock) OR atomic SQL          |
++-----------------------------------------+------------------------------+
+| 3. Multiple PODS coordinating WITHOUT DB | Distributed lock:            |
+|    (rare — e.g., schedule on 1 pod only) | ShedLock / Redisson / etcd   |
++-----------------------------------------+------------------------------+
+```
+
+**The big insight**: In a stateless microservice, **problem #1 barely exists** — there's no shared in-memory state worth locking. That's why `synchronized` / `ReentrantLock` usage has dropped dramatically.
+
+### **10.2 Where `synchronized` / `ReentrantLock` STILL Make Sense (2026)**
+
+####  In-process state in a singleton bean
+```java
+@Service
+public class MetricsAggregator {
+    private final LongAdder requests = new LongAdder();
+    public void record() { requests.increment(); }   // hot path, lock-free
+}
+```
+
+####  Coordinating threads within a batch job
+```java
+public class BatchProcessor {
+    private final Semaphore parallelism = new Semaphore(10);
+    private final ReentrantLock outputLock = new ReentrantLock();
+
+    public void process(File f) throws InterruptedException {
+        parallelism.acquire();
+        try {
+            byte[] result = doWork(f);
+            outputLock.lock();
+            try { writer.write(result); }
+            finally { outputLock.unlock(); }
+        } finally { parallelism.release(); }
+    }
+}
+```
+
+####  Library / framework code
+Spring's `DefaultSingletonBeanRegistry`, Tomcat's connection pool, Jackson's caches — all use `synchronized` internally. It's not dead, just specialized.
+
+### **10.3 Where `synchronized` is the WRONG Tool**
+
+####  Coordinating across pods (the #1 mistake)
+```java
+//  Each pod has its OWN copy of this map → "lock" only blocks threads in ONE pod
+@Service
+public class OrderService {
+    private final Set<String> processingIds = ConcurrentHashMap.newKeySet();
+
+    public synchronized void process(String orderId) {
+        if (processingIds.contains(orderId)) return;   //  Other pods don't see this!
+        processingIds.add(orderId);
+        // ...
+    }
+}
+//  10 pods → same orderId can still be processed 10 times in parallel
+```
+
+####  Preventing double-charge across replicas
+```java
+//  Wrong tool
+@Transactional
+public synchronized void charge(Order o) { ... }   //  synchronized doesn't span pods
+```
+
+** Right tool — DB-level idempotency:**
+```java
+@Transactional
+public Payment charge(Order o) {
+    try {
+        return paymentRepo.save(new Payment(o.getIdempotencyKey(), ...));
+    } catch (DataIntegrityViolationException e) {
+        return paymentRepo.findByIdempotencyKey(o.getIdempotencyKey());   // already done
+    }
+}
+// ALTER TABLE payments ADD CONSTRAINT uq_idempotency UNIQUE (idempotency_key);
+```
+
+####  Inventory decrement across pods
+```java
+//  synchronized only blocks threads in same JVM
+public synchronized void decrementStock(Long id) { ... }
+
+//  atomic SQL handles cross-pod concurrency naturally
+@Modifying
+@Query("UPDATE Product p SET p.stock = p.stock - 1 WHERE p.id = :id AND p.stock >= 1")
+int decrement(@Param("id") Long id);
+```
+
+### **10.4 What We Actually Use in Distributed Systems**
+
+####  PATTERN 1: Push concurrency to the DB (90% of cases)
+
+The DB already has locking — use it.
+
+```java
+//  Optimistic — DB-managed via @Version
+@Entity public class Product { @Version Long version; }
+
+//  Pessimistic — DB-managed via SELECT FOR UPDATE
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("SELECT p FROM Product p WHERE p.id = :id")
+Product lockForUpdate(@Param("id") Long id);
+
+//  Atomic SQL — no app lock needed
+@Modifying
+@Query("UPDATE Account SET balance = balance - :amt WHERE id = :id AND balance >= :amt")
+int debit(@Param("id") Long id, @Param("amt") BigDecimal amt);
+
+//  Unique constraint as a "lock"
+ALTER TABLE payments ADD CONSTRAINT uq_idempotency UNIQUE (idempotency_key);
+```
+
+> **First instinct in distributed systems: "Can the DB do this for me?" — usually yes.**
+
+####  PATTERN 2: Distributed locks (only when truly needed)
+
+When state is NOT in the DB but you still need cross-pod coordination:
+- "Only ONE pod should run this cron job"
+- "Only ONE pod should rebuild the search index"
+- "Only ONE pod should send the welcome email"
+
+```java
+//  ShedLock — for scheduled jobs (DB-backed, simple)
+@Scheduled(cron = "0 0 2 * * *")
+@SchedulerLock(name = "nightlyReport", lockAtMostFor = "30m", lockAtLeastFor = "5m")
+public void generateReport() { ... }   //  Only one pod runs this
+
+//  Redisson — general distributed lock
+@Autowired RedissonClient redisson;
+
+public void rebuildIndex() {
+    RLock lock = redisson.getLock("index-rebuild");
+    if (!lock.tryLock(0, 10, MINUTES)) return;   // another pod has it
+    try { searchIndex.rebuild(); }
+    finally { lock.unlock(); }
+}
+```
+
+####  PATTERN 3: Idempotency keys (don't lock — design out the contention)
+
+```java
+@PostMapping
+public Order create(@RequestHeader("Idempotency-Key") String key,
+                    @RequestBody CreateOrderRequest req) {
+    return orderService.createIdempotent(key, req);   // safe across pods + retries
+}
+```
+
+####  PATTERN 4: Single-writer per partition (Kafka, CQRS)
+
+Kafka with a partition key = `orderId` → all events for one order go to the same consumer → **no cross-pod contention by design**.
+
+```
+Order 123 events ──┐
+Order 124 events ──┼─► Kafka partition 0 ──► Consumer A   (single writer for orders 123, 124)
+                   │
+Order 125 events ──┼─► Kafka partition 1 ──► Consumer B   (single writer for order 125)
+```
+
+No locks needed — partitioning eliminates contention at the architectural level.
+
+### **10.5 The DANGER: Distributed Locks Done Wrong**
+
+Martin Kleppmann's "[How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)" — Redis-based locks (RedLock) can break under network partitions, GC pauses, or clock drift.
+
+**Real failure mode:**
+```
+Pod A: acquires lock, starts work
+Pod A: hits a 30-second GC pause
+Lock TTL expires (30s)
+Pod B: acquires lock, starts the same work
+Pod A: wakes up, "still holding lock", finishes work
+RESULT: Both pods committed → split-brain
+```
+
+**Mitigations:**
+1. **Fencing tokens** — DB rejects writes with stale (lower) tokens
+2. **Idempotency** — even if both pods run, the result is the same
+3. **Don't use distributed locks for CORRECTNESS** — use them only for OPTIMIZATION
+   ("avoid duplicate work" is OK; "guarantee uniqueness" is NOT)
+
+> **Distributed locks for correctness = scary. Use DB constraints / idempotency / single-writer partitioning instead.**
+
+### **10.6 Decision Tree (use this in interviews)**
+
+```
+Need to coordinate concurrent access?
+│
+├── Within ONE JVM (singleton bean state)?
+│   ├── Simple counter/flag?              → AtomicInteger / volatile
+│   ├── Map access?                       → ConcurrentHashMap.compute*
+│   ├── Block of code?                    → synchronized
+│   └── Need timeout/interrupt/fair/      → ReentrantLock
+│       multiple Conditions?
+│
+├── Across PODS, state in DB?
+│   ├── Low contention?                   → @Version (optimistic)
+│   ├── High contention?                  → SELECT FOR UPDATE
+│   ├── Just decrementing/updating?       → Atomic UPDATE WHERE ...
+│   ├── Preventing duplicate inserts?     → UNIQUE constraint
+│   └── Idempotency?                      → idempotency_key UNIQUE
+│
+├── Across PODS, state NOT in DB?
+│   ├── Scheduled job once cluster-wide?  → ShedLock
+│   ├── Coordinator pattern?              → Zookeeper / etcd leader election
+│   ├── "Just avoid duplicate work"?      → Redisson RLock (+ idempotency!)
+│   └── Need strict correctness?          → Move state to DB and use DB locks
+│
+└── Avoiding contention entirely?
+    ├── Partition by key (Kafka)
+    ├── Single-writer per aggregate (CQRS)
+    └── Immutable data + event sourcing
+```
+
+### **10.7 Frequency in a Real Spring Boot Microservice (2026)**
+
+```
++--------------------------------------------------------------+------+
+| Mechanism                                                     | Use  |
++--------------------------------------------------------------+------+
+| DB-level locking (@Version, SELECT FOR UPDATE, atomic SQL)    | ~70% |
+| Idempotency keys + unique constraints                         | ~15% |
+| Stateless design / Kafka partitioning                         | ~10% |
+| ShedLock for scheduled jobs                                   |  ~3% |
+| ConcurrentHashMap.compute* in app                             |  ~1% |
+| synchronized / ReentrantLock                                  |  ~1% | ← rarely
+| Redisson distributed lock                                     | <1%  |
++--------------------------------------------------------------+------+
+```
+
+### **10.8 TL;DR — Senior Answer for "Do you use synchronized?"**
+
+| Question | Answer |
+|---|---|
+| Is `synchronized` dead? | **No** — still used for in-JVM thread safety in library code, caches, and batch jobs |
+| Do I use it in microservices? | **Rarely** — services are stateless, contention lives in DB/Redis |
+| What replaced it for cross-pod? | **DB constraints, atomic SQL, optimistic locking, idempotency keys** |
+| When do I need a distributed lock? | When state isn't in DB AND you need cross-pod coordination (scheduled jobs, leader election) |
+| Best distributed lock for Spring? | **ShedLock** (jobs) or **Redisson** (general) — but always pair with idempotency |
+| Single best advice? | **Push concurrency to the DB.** Locks at the app layer are usually a sign of bad design |
+
+### **10.9 Interview Cheat Codes**
+
+> "In a stateless microservice the in-memory state isn't shared across pods, so `synchronized` only protects one JVM. I push concurrency to the DB layer — `@Version` for optimistic locking, `SELECT FOR UPDATE` for hot rows, or an atomic SQL UPDATE with a WHERE guard for inventory decrement."
+
+> "For cross-pod scheduled jobs I use ShedLock — it's a thin DB-row-based lock that ensures only one pod runs the cron at a time. For general distributed locks I'd use Redisson, but I always pair it with an idempotency mechanism because distributed locks aren't safe for correctness on their own (GC pauses can break the TTL guarantee)."
+
+> "When designing for high write contention I'd avoid locks altogether — partition by key in Kafka so one aggregate maps to one consumer, giving single-writer semantics by design. That's how Uber and Stripe scale order/payment processing."
+
+> "`synchronized` and `ReentrantLock` are still useful inside one JVM — caches, metrics aggregators, in-process queues — but they shouldn't appear in your service-layer methods unless you've truly got JVM-local mutable state."
+
+>  **"In a well-designed distributed system, you should rarely need application-level locks. If you do, that's a hint your state is in the wrong place."**
